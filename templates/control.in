@@ -1,0 +1,18 @@
+Package: %%PKG%%
+Version: %%PKG_VERSION%%
+Architecture: %%ARCH_IPK%%
+Installed-Size: %%INSTALLED_KIB%%
+Section: admin
+Priority: optional
+Maintainer: qoder-openwrt-ipk
+Source: %%SOURCE%%
+SourceName: %%PKG%%
+License: Freeware, redistribution of the unmodified official binary
+Description: %%DISPLAY%% %%CLI_VERSION%% for OpenWrt on %%ARCH_IPK%% (musl)
+ Installs the unmodified official %%BIN%% musl build together with a procd
+ service that keeps it running in remote-control mode. The daemon registers
+ this machine as an environment with the Qoder cloud, so a phone or desktop
+ signed in to the same account can drive it without SSH or port forwarding.
+ .
+ Payload arch: %%PAYLOAD_ARCH%%, libc: musl (PT_INTERP %%EXPECTED_INTERP%%).
+ Packaging mode: %%PAYLOAD_MODE%%.

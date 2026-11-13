@@ -1,0 +1,6 @@
+work/
+dist/
+dist-*/
+feed-*/
+__pycache__/
+*.pyc

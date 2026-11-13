@@ -1,0 +1,47 @@
+#!/bin/sh
+# %%DISPLAY%% entry point installed by the %%PKG%% ipk.
+# Resolves the payload location the same way fetch-payload.sh and the procd
+# service do, so all three agree no matter where the payload lives.
+
+LIBEXEC=/usr/libexec/%%PKG%%
+if [ ! -r "$LIBEXEC/payload.env" ]; then
+    echo "%%BIN%%: $LIBEXEC/payload.env is missing; reinstall the %%PKG%% package" >&2
+    exit 1
+fi
+. "$LIBEXEC/payload.env"
+if [ -r "$LIBEXEC/compat-env.sh" ]; then
+    . "$LIBEXEC/compat-env.sh"
+    apply_compat_env
+fi
+
+resolve_uci() {
+    if command -v uci >/dev/null 2>&1; then
+        uci -q get "$SRV_NAME.config.$1" 2>/dev/null
+    fi
+}
+
+pick_target() {
+    if [ "$PAYLOAD_MODE" = "embed" ]; then
+        printf '%s\n' "$PAYLOAD_PATH"
+        return 0
+    fi
+    dir="$DATA_DIR"
+    if [ -n "$QODER_OPENWRT_DATA_DIR" ]; then
+        dir="$QODER_OPENWRT_DATA_DIR"
+    else
+        cfgdir=$(resolve_uci data_dir)
+        [ -n "$cfgdir" ] && dir="$cfgdir"
+    fi
+    printf '%s/%s\n' "$dir" "$BIN_NAME"
+}
+
+target=$(pick_target)
+
+if [ ! -x "$target" ]; then
+    echo "%%BIN%%: payload not installed (looked at $target)" >&2
+    echo "  fetch it:  $LIBEXEC/fetch-payload.sh" >&2
+    echo "  offline:   $LIBEXEC/fetch-payload.sh --from /path/to/%%PAYLOAD_FILE%%" >&2
+    exit 127
+fi
+
+exec "$target" "$@"

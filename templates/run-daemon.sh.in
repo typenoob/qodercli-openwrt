@@ -1,0 +1,64 @@
+#!/bin/sh
+# Launcher for the %%DISPLAY%% remote-control daemon, started by procd via
+# /etc/init.d/%%SRV%%. Keeping the environment setup here means procd only ever
+# sees one command with no quoting hazards.
+
+LIBEXEC=/usr/libexec/%%PKG%%
+. "$LIBEXEC/payload.env"
+
+cfg() {
+    v=""
+    if command -v uci >/dev/null 2>&1; then
+        v=$(uci -q get "%%SRV%%.config.$1" 2>/dev/null)
+    fi
+    [ -n "$v" ] || v="$2"
+    printf '%s' "$v"
+}
+
+home=$(cfg home /root)
+directory=$(cfg directory "$home")
+name=$(cfg name "")
+[ -n "$name" ] || name=$(uname -n 2>/dev/null)
+[ -n "$name" ] || name=%%BIN%%-openwrt
+capacity=$(cfg capacity %%DEFAULT_CAPACITY%%)
+spawn=$(cfg spawn %%DEFAULT_SPAWN%%)
+verbose=$(cfg verbose 0)
+extra=$(cfg extra_args "")
+token_file=$(cfg token_file /etc/%%SRV%%/token)
+token_env=$(cfg token_env "%%TOKEN_ENV%%")
+
+export HOME="$home"
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin"
+export QODER_CLI_INSTALL=0
+
+# Credentials: the daemon registers with the Qoder cloud, so it needs either a
+# stored login under $HOME/.qoder or a token in this file (chmod 600), first
+# line only. The variable name differs per edition, so the list comes from
+# etc/variants.conf and uci can override it.
+if [ -f "$token_file" ]; then
+    token_value=$(sed -n '1p' "$token_file" | tr -d '\r\n')
+    if [ -z "$token_value" ]; then
+        echo "%%SRV%%: $token_file has no token on its first line" >&2
+        exit 1
+    fi
+    for token_var in $token_env; do
+        export "$token_var=$token_value"
+    done
+fi
+
+if [ ! -d "$directory" ]; then
+    echo "%%SRV%%: working directory $directory does not exist" >&2
+    exit 1
+fi
+
+set -- remote-control --directory "$directory" --capacity "$capacity"
+[ -n "$name" ] && set -- "$@" --name "$name"
+[ -n "$spawn" ] && set -- "$@" --spawn "$spawn"
+[ "$verbose" = "1" ] && set -- "$@" --verbose
+
+if [ -n "$extra" ]; then
+    # shellcheck disable=SC2086  # deliberate word splitting of the uci list
+    set -- "$@" $extra
+fi
+
+exec /usr/bin/%%BIN%% "$@"

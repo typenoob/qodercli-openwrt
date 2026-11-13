@@ -1,0 +1,30 @@
+#!/bin/sh
+# Runs after the files are unpacked. IPKG_INSTROOT is set when opkg is
+# installing into an image root or a chroot, so anything that would talk to the
+# running system has to be skipped there.
+[ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
+
+ROOT="${IPKG_INSTROOT:-}"
+
+mkdir -p "$ROOT/etc/%%SRV%%" 2>/dev/null
+chmod 0700 "$ROOT/etc/%%SRV%%" 2>/dev/null
+
+if [ -n "$ROOT" ]; then
+    exit 0
+fi
+
+if [ "%%PAYLOAD_MODE%%" = "fetch" ]; then
+    echo "%%PKG%%: files installed, payload not downloaded yet."
+    echo "  1. /usr/libexec/%%PKG%%/fetch-payload.sh     # or --from <tarball> for offline"
+    echo "  2. %%BIN%% --version"
+    echo "  3. %%BIN%% login                             # or write a PAT to /etc/%%SRV%%/token"
+    echo "  4. uci set %%SRV%%.config.enabled=1; uci commit %%SRV%%"
+    echo "     /etc/init.d/%%SRV%% enable && /etc/init.d/%%SRV%% start"
+else
+    echo "%%PKG%%: embedded payload installed at %%PAYLOAD_PATH%%."
+    echo "  1. %%BIN%% --version"
+    echo "  2. %%BIN%% login"
+    echo "  3. uci set %%SRV%%.config.enabled=1; uci commit %%SRV%%"
+    echo "     /etc/init.d/%%SRV%% enable && /etc/init.d/%%SRV%% start"
+fi
+exit 0

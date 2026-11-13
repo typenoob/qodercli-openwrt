@@ -1,0 +1,15 @@
+#!/bin/sh
+[ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
+
+ROOT="${IPKG_INSTROOT:-}"
+[ -n "$ROOT" ] && exit 0
+
+if [ -x /etc/init.d/%%SRV%% ]; then
+    /etc/init.d/%%SRV%% stop 2>/dev/null
+fi
+
+# The payload lives outside the package's file list (in data_dir), so it is
+# left in place rather than deleted behind the user's back.
+echo "%%PKG%%: removed. The payload in the configured data_dir was kept; to drop it:"
+echo "  rm -f \"\$(uci -q get %%SRV%%.config.data_dir || echo %%DATA_DIR%%)/%%BIN%%\""
+exit 0

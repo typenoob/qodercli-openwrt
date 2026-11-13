@@ -1,0 +1,97 @@
+name: nightly-repackage
+
+# The upstream CLI moves faster than OpenWrt releases do, so re-fetch the
+# official musl channel every day, re-prove the ELF compatibility gate, and
+# publish a new feed only when the version actually changed.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Pin a CLI version (leave empty for latest)
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  feed:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [qoder, qoderclicn]
+    env:
+      VARIANT: ${{ matrix.variant }}
+      PINNED: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install busybox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends busybox
+
+      - name: Build the stub feed
+        run: |
+          set -- --variant "$VARIANT" --arch all --dist "feed-$VARIANT"
+          [ -n "$PINNED" ] && set -- "$@" --version "$PINNED"
+          ./bin/build.sh "$@"
+
+      - name: Verify packages and the behavioural test suite
+        run: |
+          python3 lib/verify.py "feed-$VARIANT"
+          bin=$VARIANT; [ "$VARIANT" = qoder ] && bin=qodercli
+          ipk=$(ls -1 "feed-$VARIANT/${bin}_"*_x86_64.ipk | head -1)
+          echo "behavioural test on $ipk"
+          ./bin/test-sim.sh "$ipk"
+
+      # The compat stub is the only checked-in binary here, so CI re-proves it
+      # two ways: the bytes must still match etc/compat.conf, and the gate must
+      # still describe them (self-contained, exactly COMPAT_SYMBOLS, tiny, and
+      # genuinely imported by the payload). A rebuild is not compared byte for
+      # byte: a different clang/lld point release legitimately emits different
+      # bytes, and that invariant would fail nightly for no reason.
+      - name: Re-check the compat stub and its runtime behaviour
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld
+          sed -n 's/^SHA256_\([a-z0-9_]*\)=\(.*\)$/\2  compat\/\1\/libqoder-compat.so/p' etc/compat.conf | sha256sum -c -
+          ./bin/test-compat.sh "$(ls -1 "feed-$VARIANT"/*_x86_64.ipk | head -1)"
+
+      - name: Exercise the embed packaging path
+        if: matrix.variant == 'qoder'
+        run: |
+          # a throwaway feed directory: the 72 MiB embed ipk is a packaging check,
+          # not something the release artifact should carry
+          ./bin/build.sh --variant qoder --arch x86_64 --mode embed --dist embed-check
+          ./bin/test-sim-embed.sh "$(ls embed-check/embed/qodercli_*_x86_64.ipk | head -1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feed-${{ matrix.variant }}
+          path: feed-${{ matrix.variant }}
+          if-no-files-found: error
+
+      - name: Release when upstream published a new version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v=$(python3 -c "
+          import json,os
+          print(json.load(open(os.path.join('work/manifests', os.environ['VARIANT'] + '-latest.json')))['latest'])")
+          tag="$VARIANT-cli-$v"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already published; nothing to do"
+          else
+            gh release create "$tag" "feed-$VARIANT"/*.ipk "feed-$VARIANT"/Packages.gz \
+              --title "$VARIANT $v (OpenWrt ipk)" \
+              --notes "Repackaged from the official musl channel and gated by lib/elfcheck.py. Install and enable steps: see README.md."
+          fi

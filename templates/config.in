@@ -1,0 +1,47 @@
+config qoder 'config'
+	# Keep off until the payload is installed and the account is logged in;
+	# otherwise procd respawn-loops on an authentication error.
+	option enabled '0'
+
+	# HOME for the daemon: credentials live in $home/.qoder.
+	option home '/root'
+
+	# Working directory sessions run in, and what the environment reports.
+	option directory '/root'
+
+	# One session costs roughly 300-350 MB RSS, so never leave the upstream
+	# default of 32 on a router or SBC.
+	option capacity '%%DEFAULT_CAPACITY%%'
+
+	# same-dir | worktree
+	option spawn '%%DEFAULT_SPAWN%%'
+
+	# Display name in the app. Empty means the device hostname.
+	option name ''
+
+	# Stream session events as prefixed JSON lines on the daemon's stdout.
+	option verbose '0'
+
+	# Where the ~%%BINARY_MIB%% MiB payload is unpacked. Must be real storage,
+	# never /tmp (that is tmpfs on OpenWrt).
+	option data_dir '%%DATA_DIR%%'
+
+	# auto | on | off for the closed compat layer (see compat/shim.cpp).
+	# auto preloads the stub only on rootfses whose libstdc++ lacks a symbol
+	# the payload imports; fetch-payload.sh works that out from the loader.
+	option compat 'auto'
+
+	# Optional: a personal access token, first line only, file mode 0600.
+	option token_file '/etc/%%SRV%%/token'
+
+	# Environment variables the token is exported under. The CN build only
+	# accepts QODERCN_DEVICE_TOKEN; do not trim this unless you know the
+	# edition you run.
+	option token_env '%%TOKEN_ENV%%'
+
+	# Pass-through flags appended to `remote-control`, e.g. '--verbose'.
+	option extra_args ''
+
+	option respawn_threshold '3600'
+	option respawn_timeout '5'
+	option respawn_retry '5'

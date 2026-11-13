@@ -1,0 +1,381 @@
+#!/bin/sh
+# Fetch, place and verify the official %%DISPLAY%% musl payload for OpenWrt.
+# Nothing is ever extracted into /tmp: on OpenWrt that is tmpfs, and the
+# download plus the ~%%BINARY_MIB%% MiB binary would eat the router's RAM.
+#
+#   fetch-payload.sh                 download PAYLOAD_URL and install it
+#   fetch-payload.sh --from FILE     install from a tarball already on the device
+#   fetch-payload.sh --dir DIR       install location override (default $DATA_DIR)
+#   fetch-payload.sh --force         replace an existing payload
+#   fetch-payload.sh --verify        check the installed payload only
+#   fetch-payload.sh --allow-volatile  insist on a tmpfs/ramfs target (needs
+#                                    re-download after every reboot)
+#
+# --verify exit status: 0 payload intact and runnable here, 1 payload damaged
+# or replaced by the built-in updater (fix with --force), 4 payload intact but
+# this is a glibc rootfs, so the musl build can never start.
+#
+# Both modes end by asking this rootfs's loader whether the payload actually
+# binds (see check_loader). When the only gaps are symbols the compat stub
+# supplies, the stub is switched on for this device and recorded in
+# $COMPAT_MARKER; a gap it does not cover fails the install instead of leaving
+# procd to respawn-loop on an execve error.
+
+LIBEXEC=/usr/libexec/%%PKG%%
+. "$LIBEXEC/payload.env"
+COMPAT_READY=0
+if [ -r "$LIBEXEC/compat-env.sh" ]; then
+    . "$LIBEXEC/compat-env.sh"
+    COMPAT_READY=1
+fi
+
+BIN_NAME="${BIN_NAME:-%%BIN%%}"
+SRV_NAME="${SRV_NAME:-%%SRV%%}"
+
+say() { echo "$@" >&2; }
+
+resolve_uci() {
+    if command -v uci >/dev/null 2>&1; then
+        uci -q get "$SRV_NAME.config.$1" 2>/dev/null
+    fi
+}
+
+free_kib() {
+    df -k "$1" 2>/dev/null | awk 'NR > 1 { avail = $4 } END { print avail + 0 }'
+}
+
+# RAM-backed or kernel pseudo filesystems: df happily reports a size for them,
+# but a payload there either disappears on reboot (/tmp on OpenWrt is tmpfs) or
+# is not storage at all (/dev, /run, /sys/fs/cgroup). squashfs is the read-only
+# rootfs. None of these may host the payload.
+volatile_fstype() {
+    case "$1" in
+        tmpfs|ramfs|devtmpfs|squashfs|proc|sysfs|cgroup|cgroup2|pstore|configfs|debugfs|tracefs|efivarfs|mqueue|hugetlbfs|bpf|autofs|devpts|fusectl|rpc_pipefs|securityfs|selinuxfs|binfmt_misc)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# Filesystems without unix ownership/permission semantics. An executable payload
+# usually still runs there (vfat is mounted fmask=0000), but it is a boot
+# partition and nothing about the file survives a chmod - so warn, do not pick.
+permless_fstype() {
+    case "$1" in vfat|msdos|fat|exfat|ntfs|ntfs3) return 0 ;; esac
+    return 1
+}
+
+# Longest mount point covering $1, with its type and options.
+mount_of() {
+    awk -v p="$1" '
+        { mp = $2
+          if (p != mp && index(p, mp "/") != 1) next
+          if (length(mp) > best_len) { best = mp; fs = $3; opt = $4; best_len = length(mp) } }
+        END { if (best) printf "%s %s %s\n", best, fs, opt }' /proc/mounts
+}
+
+# Mounts that could actually hold the payload, in /proc/mounts order.
+suggest_mounts() {
+    need=$1
+    while read -r dev mp fs opt rest; do
+        volatile_fstype "$fs" && continue
+        case ",$opt," in *,noexec,*) continue ;; esac
+        avail=$(free_kib "$mp")
+        [ "${avail:-0}" -ge "$need" ] || continue
+        warn=""
+        permless_fstype "$fs" && warn="  <- no unix permissions, pick only if nothing else"
+        printf '         %-22s %6d MiB  %s%s\n' "$mp" "$((avail / 1024))" "$fs" "$warn"
+    done < /proc/mounts
+}
+
+# The list is stderr-bound like every other message here, and an empty list has
+# to say so: on a small-flash router every mount can be too tight, and silence
+# after a header line reads like a bug.
+show_storage_options() {
+    list=$(suggest_mounts "$1")
+    if [ -n "$list" ]; then
+        printf '%s\n' "$list" >&2
+    else
+        say "         (none: no writable mount has $((1 + $1 / 1024)) MiB free apart from RAM)"
+        say "         copy the tarball in and use: $0 --from /path/to/%%PAYLOAD_FILE%% --dir <mount>"
+    fi
+}
+
+fetch_to() {
+    url="$1" dest="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 30 --max-time 1800 -o "$dest" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$dest" "$url"
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        uclient-fetch -q -O "$dest" "$url"
+    else
+        say "%%PKG%%: need curl, wget or uclient-fetch to download the payload"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# loader test: the checksum says the payload is the official bytes; only the
+# rootfs's own loader says whether those bytes can start here.
+#
+# musl resolves every strong import at exec time and reports the first failure
+# as
+#   Error relocating <path>: <symbol>: symbol not found
+# so one line of that output is a complete answer: it names the symbol, and
+# COMPAT_SYMBOLS says whether the shipped stub supplies it.
+# ---------------------------------------------------------------------------
+missing_symbols() {
+    printf '%s\n' "$1" | sed -n 's/.*Error relocating [^:]*: \([^:]*\): symbol not found.*/\1/p' | sort -u
+}
+
+probe_payload() {
+    # No timeout wrapper: busybox spells it "-t N", coreutils spells it "N", and
+    # a wrong flag reads as no output, which would look like a clean load.
+    "$payload" --version 2>&1
+}
+
+check_loader() {
+    [ "$COMPAT_READY" = 1 ] || return 0
+    # Without the interpreter there is no loader to ask, and "execve failed"
+    # would look like a clean run.
+    if [ ! -e "$EXPECTED_INTERP" ]; then
+        say "    loader test skipped: no $EXPECTED_INTERP here"
+        return 0
+    fi
+    say "==> checking that this rootfs can actually load the payload"
+    out=$(probe_payload)
+    rc=$?
+    miss=$(missing_symbols "$out")
+    if [ -z "$miss" ]; then
+        if [ "$rc" != 0 ]; then
+            # Silence is not success. GNU and BusyBox spell their timeout flags
+            # differently, the payload may die for a reason that has nothing to
+            # do with relocation, and any of those produce no error line while
+            # still not running. Say so instead of reporting a clean load.
+            say "%%PKG%%: the payload exited $rc without a relocation error:" >&2
+            printf '%s\n' "$out" | sed 's/^/         /' >&2
+            say "       the compat shim cannot be judged from that; fix this first" >&2
+            return 1
+        fi
+        rm -f "$COMPAT_MARKER"
+        say "    loads cleanly; compat shim not needed here"
+        return 0
+    fi
+
+    uncovered=""
+    for s in $miss; do
+        case ",$COMPAT_SYMBOLS," in
+            *",$s,"*) ;;
+            *) uncovered="$uncovered $s" ;;
+        esac
+    done
+    if [ -n "$uncovered" ]; then
+        rm -f "$COMPAT_MARKER"
+        say "%%PKG%%: this rootfs cannot resolve$uncovered" >&2
+        say "         the shipped stub only covers: $COMPAT_SYMBOLS" >&2
+        say "       that gap is real code, not a missing abort path: add it to" >&2
+        say "       compat/shim.cpp or install a newer libstdc++ on the device." >&2
+        return 1
+    fi
+
+    say "    libstdc++ here predates: $miss"
+    if [ "$(compat_policy)" = off ]; then
+        say "%%PKG%%: compat is disabled (uci set %%SRV%%.compat=off), so this payload" >&2
+        say "         will not start. Re-enable with: uci set %%SRV%%.compat=auto" >&2
+        return 1
+    fi
+    printf '%s\n' "$miss" > "$COMPAT_MARKER"
+    out=$( export LD_PRELOAD="$COMPAT_LIB"; probe_payload )
+    rc=$?
+    miss=$(missing_symbols "$out")
+    if [ -n "$miss" ]; then
+        rm -f "$COMPAT_MARKER"
+        say "%%PKG%%: still unresolvable with the compat shim: $miss" >&2
+        return 1
+    fi
+    if [ "$rc" != 0 ]; then
+        rm -f "$COMPAT_MARKER"
+        say "%%PKG%%: the shim resolved the symbols but the payload still exited $rc:" >&2
+        printf '%s\n' "$out" | sed 's/^/         /' >&2
+        return 1
+    fi
+    say "    compat shim enabled for this rootfs ($COMPAT_MARKER)"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# arguments
+# ---------------------------------------------------------------------------
+mode=install
+src=""
+dir=""
+dir_given=0
+force=0
+allow_volatile=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --from)   src="$2"; shift 2 ;;
+        --dir)    dir="$2"; dir_given=1; shift 2 ;;
+        --force)  force=1; shift ;;
+        --allow-volatile) allow_volatile=1; shift ;;
+        --verify) mode=verify; shift ;;
+        -h | --help)
+            awk 'NR == 1 { next } /^[A-Za-z_]+=|^$/ { exit } { sub(/^# ?/, ""); print }' "$0"
+            exit 0 ;;
+        *) say "unknown option: $1"; exit 2 ;;
+    esac
+done
+
+if [ "$PAYLOAD_MODE" = "embed" ] && [ "$dir_given" = 0 ]; then
+    # An embed package keeps its payload next to the wrapper, and the wrapper
+    # runs that copy. Looking under data_dir instead would report "no payload"
+    # for an installation that is perfectly intact.
+    payload="$PAYLOAD_PATH"
+    dir=$(dirname "$payload")
+else
+    if [ -z "$dir" ]; then
+        [ -n "$QODER_OPENWRT_DATA_DIR" ] && dir="$QODER_OPENWRT_DATA_DIR"
+    fi
+    [ -n "$dir" ] || dir=$(resolve_uci data_dir)
+    [ -n "$dir" ] || dir="$DATA_DIR"
+    payload="$dir/$BIN_NAME"
+fi
+
+# ---------------------------------------------------------------------------
+# verify mode: does what is on disk still match what we shipped?
+# ---------------------------------------------------------------------------
+if [ "$mode" = "verify" ]; then
+    if [ ! -s "$payload" ]; then
+        say "%%PKG%%: no payload at $payload (run $0 first)"
+        exit 1
+    fi
+    actual=$(sha256sum "$payload" | awk '{ print $1 }')
+    if [ "$actual" != "$BINARY_SHA256" ]; then
+        say "%%PKG%%: payload hash does not match the official %%CLI_VERSION%% %%PAYLOAD_ARCH%% musl build"
+        say "         got      $actual"
+        say "         expected $BINARY_SHA256"
+        say "       the built-in updater replaces this file with a glibc build, which"
+        say "       cannot start on OpenWrt. Restore it with: $0 --force"
+        exit 1
+    fi
+    if [ ! -e "$EXPECTED_INTERP" ]; then
+        say "%%PKG%%: payload is correct but this rootfs has no $EXPECTED_INTERP loader"
+        say "         this looks like a glibc image; the musl build cannot start here"
+        exit 4
+    fi
+    say "%%PKG%%: payload OK ($BIN_NAME %%CLI_VERSION%%, %%PAYLOAD_ARCH%% musl, $EXPECTED_INTERP present)"
+    check_loader || exit 1
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# install mode
+# ---------------------------------------------------------------------------
+mkdir -p "$dir" 2>/dev/null || {
+    say "%%PKG%%: cannot create $dir"
+    exit 1
+}
+
+if [ -x "$payload" ] && [ "$force" != 1 ]; then
+    say "%%PKG%%: $payload already exists; use --force to replace it"
+    exit 0
+fi
+
+# The target itself has to be durable storage: a payload placed on tmpfs is
+# gone at the next reboot while uci still points the daemon at it, and a noexec
+# mount makes it unrunnable even though the copy looks successful.
+entry=$(mount_of "$dir")
+if [ -n "$entry" ]; then
+    set -- $entry
+    target_mnt=$1
+    target_fs=$2
+    target_opt=$3
+    if volatile_fstype "$target_fs"; then
+        say "%%PKG%%: $dir is on $target_mnt ($target_fs): RAM-backed or read-only."
+        say "       the payload would have to be re-downloaded after every reboot"
+        say "       and would eat memory the daemon needs. Use real storage:"
+        if [ "$allow_volatile" = 1 ]; then
+            say "       (proceeding because --allow-volatile was given)"
+        else
+            show_storage_options "$((BINARY_BYTES / 1024))"
+            say "       or insist: $0 --dir $dir --allow-volatile"
+            exit 1
+        fi
+    fi
+    case ",$target_opt," in
+        *,noexec,*)
+            say "%%PKG%%: $target_mnt is mounted noexec - the payload could not run from $dir"
+            exit 1 ;;
+    esac
+    if permless_fstype "$target_fs"; then
+        say "%%PKG%%: warning: $target_mnt is $target_fs, which stores no owner or permission bits"
+    fi
+fi
+
+# The tarball is needed on disk while extracting, so require room for both it
+# and the binary, plus a margin for the opkg/uci plumbing.
+need_kib=$(( (BINARY_BYTES + 1024 * 1024 * 80) / 1024 + NEEDED_FREE_KIB ))
+avail=$(free_kib "$dir")
+if [ "${avail:-0}" -lt "$need_kib" ]; then
+    say "%%PKG%%: $dir has ${avail} KiB free, needs about $((need_kib / 1024)) MiB"
+    say "       mounts that can hold it (pseudo filesystems and /tmp are not listed):"
+    show_storage_options "$need_kib"
+    say "       then re-run with: $0 --dir /mnt/<storage>/%%PKG%%"
+    say "       or persist it:    uci set %%SRV%%.config.data_dir=/mnt/<storage>/%%PKG%%; uci commit %%SRV%%"
+    exit 1
+fi
+
+tmp="$dir/$BIN_NAME.payload.tar.gz"
+if [ -n "$src" ]; then
+    [ -r "$src" ] || { say "%%PKG%%: cannot read $src"; exit 1; }
+    tmp="$src"
+    keep_tmp=1
+else
+    say "==> downloading %%PAYLOAD_FILE%%"
+    fetch_to "$PAYLOAD_URL" "$tmp" || { rm -f "$tmp"; say "%%PKG%%: download failed: $PAYLOAD_URL"; exit 1; }
+    keep_tmp=0
+fi
+
+say "==> verifying sha256"
+actual=$(sha256sum "$tmp" | awk '{ print $1 }')
+if [ "$actual" != "$PAYLOAD_SHA256" ]; then
+    say "%%PKG%%: checksum mismatch"
+    say "         expected $PAYLOAD_SHA256"
+    say "         got      $actual"
+    [ "$keep_tmp" = 1 ] || rm -f "$tmp"
+    exit 1
+fi
+
+say "==> extracting to $dir"
+umask 022
+if ! tar -xzf "$tmp" -C "$dir"; then
+    say "%%PKG%%: extraction failed; on a stock image this usually means busybox tar"
+    say "       was built without gzip support (opkg install tar)"
+    [ "$keep_tmp" = 1 ] || rm -f "$tmp"
+    exit 1
+fi
+[ "$keep_tmp" = 1 ] || rm -f "$tmp"
+
+if [ ! -f "$payload" ]; then
+    say "%%PKG%%: expected $payload after extraction, not found"
+    exit 1
+fi
+chmod 0755 "$payload"
+
+# Fail here rather than letting procd respawn-loop on an unrunnable binary.
+if [ ! -e "$EXPECTED_INTERP" ]; then
+    say "%%PKG%%: WARNING this rootfs has no $EXPECTED_INTERP."
+    say "           The payload is a musl build, so execve will fail with 'not found'"
+    say "           unless the device runs a glibc image or has a musl loader shipped"
+    say "           by the vendor build. Check: ls -l /lib/ld-musl-*"
+else
+    say "==> musl loader present: $EXPECTED_INTERP"
+fi
+
+say "==> installed $payload ($BIN_NAME %%CLI_VERSION%%, %%PAYLOAD_ARCH%% musl)"
+check_loader || {
+    say "       the package is intact but this device cannot start it; see above"
+    exit 1
+}
+say "   next: %%BIN%% --version, then log in before enabling the service"
+exit 0

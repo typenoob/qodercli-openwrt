@@ -1,0 +1,53 @@
+#!/bin/sh
+# Closed compat layer: adds the stub library to LD_PRELOAD, but only where this
+# rootfs actually needs it.
+#
+# A musl loader aborts on a single unresolved strong symbol, and libstdc++ on
+# older OpenWrt images predates the assertion path the official payload was
+# linked against:
+#
+#   Error relocating <payload>: _ZSt21__glibcxx_assert_failPKciS0_S0_: symbol not found
+#
+# The stub supplies that name and nothing else. It carries no interpreter and no
+# DT_NEEDED, so it can neither pull in a second C++ runtime nor fail to load.
+#
+# LD_PRELOAD and not a library search path, because DT_NEEDED lookup is by name:
+# nothing on this system would ever open a file called libqoder-compat.so.
+#
+# uci option compat decides the mode:
+#   auto (default) - preload only if fetch-payload.sh proved this rootfs needs it
+#   on             - always preload, e.g. to debug a loader error by hand
+#   off            - never preload; the payload must resolve on its own
+# The proof itself is the marker file, written from the loader's own verdict.
+
+COMPAT_LIB=%%COMPAT_LIB%%
+COMPAT_MARKER=%%COMPAT_MARKER%%
+COMPAT_SYMBOLS=%%COMPAT_SYMBOLS%%
+
+compat_policy() {
+    v=""
+    if command -v uci >/dev/null 2>&1; then
+        v=$(uci -q get "%%SRV%%.config.compat" 2>/dev/null)
+    fi
+    case "$v" in
+        on | off) printf '%s' "$v" ;;
+        *)      printf 'auto' ;;
+    esac
+}
+
+apply_compat_env() {
+    [ -r "$COMPAT_LIB" ] || return 0
+    case "$(compat_policy)" in
+        on) ;;
+        off) return 0 ;;
+        *) [ -f "$COMPAT_MARKER" ] || return 0 ;;
+    esac
+    # Never reorder or duplicate an existing preload: a caller may already be
+    # tracing or sandboxing us, and the payload only needs the stub once.
+    case " ${LD_PRELOAD:-} " in
+        *" $COMPAT_LIB "*) return 0 ;;
+    esac
+    LD_PRELOAD="${LD_PRELOAD:+$LD_PRELOAD }$COMPAT_LIB"
+    export LD_PRELOAD
+    return 0
+}
